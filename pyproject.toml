@@ -2,6 +2,7 @@
 name = "coupon-service"
 version = "0.1.0"
 description = "Coupon redemption service for e-commerce checkout"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
