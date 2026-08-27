@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app import clock as clock_module
 from app.clock import FrozenClock, SystemClock, isoformat_utc, parse_utc, to_utc
 
@@ -66,3 +68,78 @@ def test_naive_string_is_treated_as_utc():
 def test_isoformat_round_trips():
     instant = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
     assert parse_utc(isoformat_utc(instant)) == instant
+
+
+def test_frozen_clock_accepts_a_naive_instant_as_utc():
+    clock = FrozenClock(datetime(2026, 6, 1, 12, 0, 0, 123456))
+    assert clock.now() == datetime(2026, 6, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
+
+
+def test_frozen_clock_converts_an_offset_bearing_instant():
+    tz = timezone(timedelta(hours=2))
+    clock = FrozenClock(datetime(2026, 6, 1, 14, 0, tzinfo=tz))
+    assert clock.now() == datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_frozen_clock_can_be_repinned():
+    clock = FrozenClock(datetime(2026, 6, 1, tzinfo=timezone.utc))
+    later = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    clock.set(later)
+    assert clock.now() == later
+
+
+@pytest.mark.parametrize(
+    "delta, expired",
+    [
+        (timedelta(microseconds=-1), False),
+        (timedelta(0), True),
+        (timedelta(microseconds=1), True),
+    ],
+)
+def test_expiry_boundary_resolves_to_the_microsecond(delta, expired):
+    """Plan §8.4: expires_at - 1µs succeeds, exactly expires_at and +1µs do not."""
+    expires_at = datetime(2026, 6, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    clock = FrozenClock(expires_at + delta)
+    assert (clock.now() >= expires_at) is expired
+
+
+def test_use_clock_installs_and_restores():
+    instant = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    frozen = FrozenClock(instant)
+    with clock_module.use_clock(frozen) as installed:
+        assert installed is frozen
+        assert clock_module.get_clock().now() == instant
+    assert isinstance(clock_module.get_clock(), SystemClock)
+
+
+def test_use_clock_restores_after_an_exception():
+    with pytest.raises(RuntimeError):
+        with clock_module.use_clock(FrozenClock(datetime(2030, 1, 1, tzinfo=timezone.utc))):
+            raise RuntimeError("boom")
+    assert isinstance(clock_module.get_clock(), SystemClock)
+
+
+def test_to_utc_converts_an_aware_datetime():
+    tz = timezone(timedelta(hours=-5))
+    converted = to_utc(datetime(2026, 1, 1, 4, 0, tzinfo=tz))
+    assert converted == datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+    assert converted.utcoffset() == timedelta(0)
+
+
+def test_parse_utc_preserves_microseconds():
+    assert parse_utc("2026-01-01T09:00:00.000001Z").microsecond == 1
+
+
+def test_parse_utc_tolerates_surrounding_whitespace():
+    assert parse_utc("  2026-01-01T09:00:00Z  ") == datetime(
+        2026, 1, 1, 9, 0, tzinfo=timezone.utc
+    )
+
+
+def test_parse_utc_rejects_a_non_timestamp():
+    with pytest.raises(ValueError):
+        parse_utc("not-a-timestamp")
+
+
+def test_isoformat_utc_renders_a_naive_datetime_as_utc():
+    assert isoformat_utc(datetime(2026, 1, 1, 9, 0)) == "2026-01-01T09:00:00+00:00"

@@ -12,8 +12,9 @@ expiry microsecond.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Iterator, Protocol
 
 
 class Clock(Protocol):
@@ -72,6 +73,21 @@ def set_clock(clock: Clock) -> None:
 def reset_clock() -> None:
     """Restore the real clock."""
     set_clock(SystemClock())
+
+
+@contextmanager
+def use_clock(clock: Clock) -> Iterator[Clock]:
+    """Install ``clock`` for the duration of the block, then restore.
+
+    Convenience over :func:`set_clock` for tests that need a pinned instant in
+    one scope only; the previous clock comes back even if the block raises.
+    """
+    previous = get_clock()
+    set_clock(clock)
+    try:
+        yield clock
+    finally:
+        set_clock(previous)
 
 
 def to_utc(value: datetime) -> datetime:
