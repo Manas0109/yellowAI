@@ -78,3 +78,59 @@ def test_validation_failure_uses_the_same_envelope(envelope_client):
     assert set(response.json()) == {"error", "message"}
     assert response.json()["error"] == "VALIDATION_ERROR"
     assert "detail" not in response.json()
+
+
+def test_every_message_names_the_identifier_at_fault():
+    """A log line has to be actionable without the request body next to it."""
+    assert "cust-1" in errors.CustomerAlreadyRedeemed("SAVE20", "cust-1").message
+    assert "order-1" in errors.OrderAlreadyHasRedemption("order-1").message
+    assert "key-1" in errors.IdempotencyKeyReuse("key-1").message
+    for exc, _, _ in EXPECTED_MAPPING:
+        assert exc.message.endswith(".")
+
+
+def test_missing_body_uses_the_same_envelope(envelope_client):
+    response = envelope_client.post("/validate")
+    assert response.status_code == 422
+    assert set(response.json()) == {"error", "message"}
+
+
+def test_no_failure_response_carries_a_detail_key(envelope_client):
+    """Plan §6: `detail` appears nowhere, so clients never special-case a shape."""
+    responses = [envelope_client.get(f"/boom/{code}") for _, code, _ in EXPECTED_MAPPING]
+    responses.append(envelope_client.post("/validate", json={}))
+
+    for response in responses:
+        assert "detail" not in response.json()
+        assert set(response.json()) == {"error", "message"}
+
+
+async def test_redeem_without_idempotency_key_is_422_in_the_envelope(client):
+    """Issue #3 acceptance criterion, exercised against the real app.
+
+    The header is declared required on the route, so its absence is a Pydantic
+    validation failure — and must surface in the same two-key envelope as every
+    other failure, not FastAPI's `{"detail": [...]}`.
+    """
+    response = await client.post(
+        "/redeem",
+        json={"code": "SAVE20", "customer_id": "cust-1", "order_id": "order-1"},
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert set(payload) == {"error", "message"}
+    assert payload["error"] == "VALIDATION_ERROR"
+    assert "Idempotency-Key" in payload["message"]
+
+
+async def test_empty_idempotency_key_is_rejected(client):
+    """`min_length=1` on the header — a blank key is not a key."""
+    response = await client.post(
+        "/redeem",
+        json={"code": "SAVE20", "customer_id": "cust-1", "order_id": "order-1"},
+        headers={"Idempotency-Key": ""},
+    )
+
+    assert response.status_code == 422
+    assert set(response.json()) == {"error", "message"}
