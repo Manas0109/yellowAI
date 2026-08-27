@@ -5,15 +5,28 @@ no two write paths can interleave, and the redemption cap holds under a burst
 of simultaneous checkouts.
 
 That guarantee is only true **within one process**. See the README: a
-multi-worker deploy would give each worker its own lock and break it. The
-database-level defences below (``BEGIN IMMEDIATE``, the conditional ``UPDATE``,
-the UNIQUE constraints) are kept precisely so the invariant does not rest
-solely on deployment topology.
+multi-worker deploy would give each worker its own lock and break it.
+
+The lock is not merely an optimisation over the database-level defences. All
+requests share a single ``aiosqlite`` connection, and SQLite cannot nest
+transactions on one connection — so with the lock removed, overlapping redeems
+do not degrade into a race, they fail outright with "cannot start a transaction
+within a transaction". This is verified: sabotaging the lock makes
+``tests/test_concurrency.py`` fail with exactly that error.
+
+The database-level defences below (``BEGIN IMMEDIATE``, the conditional
+``UPDATE``, the UNIQUE constraints) are therefore a second line of defence
+against a *different* failure — a future refactor to a connection pool or
+multiple workers, where overlapping transactions become possible and a
+read-then-write would silently lose updates. They are not redundant, but they
+do not make the lock optional today.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from datetime import datetime
 
@@ -24,6 +37,7 @@ from app.db import write_transaction
 from app.errors import (
     CustomerAlreadyRedeemed,
     CouponExpired,
+    IdempotencyKeyReuse,
     NoRedemptionsLeft,
     OrderAlreadyHasRedemption,
     UnknownCode,
@@ -53,9 +67,9 @@ async def redeem(request: RedeemRequest, idempotency_key: str) -> RedeemResponse
         now = get_clock().now()
 
         async with write_transaction() as tx:
-            # Step 2 in plan §4 — the idempotency-key lookup — lands here in
-            # issue #9. It must stay inside this transaction so the key record
-            # and the counter move together.
+            replay = await _replay_if_seen(tx, idempotency_key, request)
+            if replay is not None:
+                return replay
 
             coupon = await _load_coupon(tx, request.code)
             if coupon is None:
@@ -73,8 +87,10 @@ async def redeem(request: RedeemRequest, idempotency_key: str) -> RedeemResponse
             if await _order_has_redemption(tx, request.order_id):
                 raise OrderAlreadyHasRedemption(request.order_id)
 
-            # The check and the increment are one statement, so no read-then-write
-            # window exists even if the lock above were removed.
+            # The check and the increment are one statement, so there is no
+            # read-then-write window to lose an update in. Redundant while the
+            # lock serialises writers, and the thing that would still hold the
+            # cap if this ever ran with a connection pool or several workers.
             cursor = await tx.execute(
                 "UPDATE coupons SET redeemed_count = redeemed_count + 1"
                 " WHERE code = ? AND redeemed_count < max_redemptions",
@@ -101,14 +117,30 @@ async def redeem(request: RedeemRequest, idempotency_key: str) -> RedeemResponse
                 # than a 500 — the DB is the last line of defence, not a bug.
                 raise _translate_integrity_error(exc, request) from exc
 
-            # Step 9 in plan §4 — storing the idempotency key and its response —
-            # lands here in issue #9, inside this same transaction.
-
             remaining = coupon["max_redemptions"] - (coupon["redeemed_count"] + 1)
-            return RedeemResponse(
+            response = RedeemResponse(
                 remaining=remaining,
                 discount_percent=coupon["discount_percent"],
             )
+
+            # Recorded in the same transaction as the increment and the
+            # redemption row, so a crash can neither burn a slot without a
+            # record of it nor record a key whose redemption never happened.
+            # Only successes get here: a failure raised above, rolling this
+            # back, which is what lets a retry re-evaluate instead of replaying
+            # a stale rejection.
+            await tx.execute(
+                "INSERT INTO idempotency_keys (key, request_hash, response_body,"
+                " created_at) VALUES (?, ?, ?, ?)",
+                (
+                    idempotency_key,
+                    _request_hash(request),
+                    response.model_dump_json(),
+                    isoformat_utc(now),
+                ),
+            )
+
+            return response
 
 
 async def cancel(order_id: str) -> CancelResponse:
@@ -162,6 +194,59 @@ async def cancel(order_id: str) -> CancelResponse:
                 code=redemption["code"],
                 remaining=remaining,
             )
+
+
+def _request_hash(request: RedeemRequest) -> str:
+    """Fingerprint the request a key was first used with.
+
+    Canonical form — sorted keys, no incidental whitespace — so two logically
+    identical bodies always hash the same regardless of how the client
+    serialised them.
+    """
+    canonical = json.dumps(
+        {
+            "code": request.code,
+            "customer_id": request.customer_id,
+            "order_id": request.order_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+async def _replay_if_seen(
+    tx: aiosqlite.Connection, idempotency_key: str, request: RedeemRequest
+) -> RedeemResponse | None:
+    """Return the stored response if this key already succeeded.
+
+    There is deliberately no in-flight/PENDING state here. A duplicate key
+    arriving while the first request is still running simply blocks on
+    :data:`write_lock`, and by the time it gets in, the first transaction has
+    committed and its key record is visible — so it replays. That removes an
+    entire subsystem: no 409-in-progress, no waiter machinery, and no
+    crash-recovery policy for half-written pending rows.
+
+    ``remaining`` in the returned body is the value frozen at the first
+    success, not the live counter. Replaying means returning the original
+    answer; a client that wants current state can GET the coupon.
+    """
+    async with tx.execute(
+        "SELECT request_hash, response_body FROM idempotency_keys WHERE key = ?",
+        (idempotency_key,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    if row["request_hash"] != _request_hash(request):
+        # Same key, different request. That is a client bug, and guessing which
+        # of the two it meant would be worse than saying so.
+        raise IdempotencyKeyReuse(idempotency_key)
+
+    stored = json.loads(row["response_body"])
+    return RedeemResponse(**{**stored, "replay": True})
 
 
 def _translate_integrity_error(

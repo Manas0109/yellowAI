@@ -105,8 +105,12 @@ async def write_transaction() -> AsyncIterator[aiosqlite.Connection]:
 
     ``BEGIN IMMEDIATE`` takes the write lock up front rather than upgrading a
     read lock mid-transaction, so a read-then-write sequence cannot lose its
-    place to another writer. Belt and braces alongside the asyncio lock in
-    ``service.py``: the guarantee should not rest solely on process topology.
+    place to another writer.
+
+    Note this cannot nest: every request shares one connection, so the asyncio
+    lock in ``service.py`` is what keeps two transactions from overlapping here.
+    This matters if the connection ever becomes a pool — then these guards
+    start doing real work, and the lock stops being sufficient on its own.
     """
     conn = get_db()
     await conn.execute("BEGIN IMMEDIATE;")
