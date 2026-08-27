@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from tests.conftest import NOW, active_count, redeem, seed_coupon, stored_count
+from tests.conftest import NOW, active_count, key_count, redeem, seed_coupon, stored_count
 
 
 async def test_happy_path_increments_by_exactly_one(client, conn):
@@ -127,15 +127,16 @@ async def test_failures_leave_no_side_effect(client, conn):
     """A rejected redemption must not move the counter or record anything."""
     await seed_coupon(client, max_redemptions=1)
     await redeem(client, order_id="order-1")
-    before = (await stored_count(conn), await active_count(conn))
+    before = (await stored_count(conn), await active_count(conn), await key_count(conn))
 
     await redeem(client, code="NOPE", order_id="order-x")
     await redeem(client, order_id="order-2")
     await redeem(client, customer_id="cust-9", order_id="order-1")
 
-    assert (await stored_count(conn), await active_count(conn)) == before
-    async with conn.execute("SELECT COUNT(*) FROM idempotency_keys") as cursor:
-        assert (await cursor.fetchone())[0] == 0
+    # The one stored key belongs to the success above; none of the three
+    # rejections may have left anything behind.
+    after = (await stored_count(conn), await active_count(conn), await key_count(conn))
+    assert after == before
 
 
 async def test_missing_idempotency_key_is_422(client):

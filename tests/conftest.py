@@ -7,6 +7,7 @@ same WAL-mode file backend the service actually runs on.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -40,6 +41,47 @@ def frozen_clock():
     clock_module.reset_clock()
 
 
+async def assert_invariants(connection) -> None:
+    """The service's core invariants, checked after every test (plan §8 item 8).
+
+    A test that passes its own assertions while leaving the counter disagreeing
+    with the redemption rows has still found a bug. This is where that is
+    caught, for every coupon, whether or not the test thought to look.
+    """
+    async with connection.execute(
+        "SELECT code, max_redemptions, redeemed_count FROM coupons"
+    ) as cursor:
+        coupons = await cursor.fetchall()
+
+    for coupon in coupons:
+        code, cap, counter = coupon["code"], coupon["max_redemptions"], coupon["redeemed_count"]
+        assert 0 <= counter <= cap, f"{code}: redeemed_count {counter} outside [0, {cap}]"
+
+        async with connection.execute(
+            "SELECT COUNT(*) FROM redemptions WHERE code = ? AND status = 'ACTIVE'",
+            (code,),
+        ) as cursor:
+            active = (await cursor.fetchone())[0]
+
+        assert counter == active, (
+            f"{code}: stored redeemed_count {counter} disagrees with "
+            f"{active} active redemption rows"
+        )
+
+
+@pytest.fixture(autouse=True)
+def reset_write_lock():
+    """Fail loudly if a test leaves the module-level lock held.
+
+    The lock is module state shared across tests; a leaked hold would deadlock
+    whatever ran next, with a timeout as the only clue.
+    """
+    yield
+    from app.service import write_lock
+
+    assert not write_lock.locked(), "test finished while still holding write_lock"
+
+
 @pytest_asyncio.fixture
 async def client(conn, frozen_clock):
     """An HTTP client bound to the app, over the per-test database.
@@ -50,6 +92,11 @@ async def client(conn, frozen_clock):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         yield http
+        # Checked here rather than on `conn` so it covers exactly the tests that
+        # drove the service through its API. The low-level tests in test_db.py
+        # write rows directly to prove a constraint fires, and would trip an
+        # invariant that only the service is responsible for upholding.
+        await assert_invariants(conn)
 
 
 async def seed_coupon(
@@ -76,11 +123,16 @@ async def seed_coupon(
 
 
 async def redeem(client, code="SAVE20", customer_id="cust-1", order_id="order-1", key=None):
-    """Redeem over HTTP with a per-call idempotency key by default."""
+    """Redeem over HTTP.
+
+    The default key is unique per call, so a test that reuses an ``order_id``
+    exercises the order check rather than tripping over key reuse first. Tests
+    about idempotency pass an explicit ``key``.
+    """
     return await client.post(
         "/redeem",
         json={"code": code, "customer_id": customer_id, "order_id": order_id},
-        headers={"Idempotency-Key": key or f"key-{order_id}"},
+        headers={"Idempotency-Key": key or f"key-{uuid4()}"},
     )
 
 
@@ -89,6 +141,11 @@ async def active_count(conn, code="SAVE20") -> int:
         "SELECT COUNT(*) FROM redemptions WHERE code = ? AND status = 'ACTIVE'",
         (code,),
     ) as cursor:
+        return (await cursor.fetchone())[0]
+
+
+async def key_count(conn) -> int:
+    async with conn.execute("SELECT COUNT(*) FROM idempotency_keys") as cursor:
         return (await cursor.fetchone())[0]
 
 

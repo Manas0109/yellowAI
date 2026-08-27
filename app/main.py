@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -138,15 +138,23 @@ async def get_coupon(code: str) -> CouponResponse:
 @app.post("/redeem", response_model=RedeemResponse)
 async def redeem(
     request: RedeemRequest,
+    response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
 ) -> RedeemResponse:
     """Consume a redemption slot.
 
     ``Idempotency-Key`` is required — a missing header fails validation and
-    comes back as a 422 in the standard envelope. Key *handling* (replay,
-    reuse detection) lands in issue #9; the header is threaded through now.
+    comes back as a 422 in the standard envelope.
+
+    A replay returns 200 with the original body, not an error. The spec lists
+    "idempotency replay" among the failure modes, but a retried success is a
+    success — signalling it as one would defeat the point of retrying. The
+    ``Idempotency-Replayed`` header marks it for anyone debugging a retry storm.
     """
-    return await service.redeem(request, idempotency_key)
+    result = await service.redeem(request, idempotency_key)
+    if result.replay:
+        response.headers["Idempotency-Replayed"] = "true"
+    return result
 
 
 @app.post("/orders/{order_id}/cancel", response_model=CancelResponse)

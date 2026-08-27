@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 
-from tests.conftest import NOW, seed_coupon
+from tests.conftest import NOW, redeem, seed_coupon
 
 
 async def test_create_returns_201_with_the_full_response(client):
@@ -72,8 +72,8 @@ async def test_duplicate_code_is_rejected(client):
 async def test_duplicate_attempt_leaves_the_original_row_untouched(client, conn):
     """A re-seed must never reset redeemed_count — that would blow the cap."""
     await seed_coupon(client, max_redemptions=10)
-    await conn.execute("UPDATE coupons SET redeemed_count = 7 WHERE code = 'SAVE20'")
-    await conn.commit()
+    for n in range(3):
+        await redeem(client, customer_id=f"cust-{n}", order_id=f"order-{n}")
 
     await client.post(
         "/coupons",
@@ -91,7 +91,7 @@ async def test_duplicate_attempt_leaves_the_original_row_untouched(client, conn)
         " FROM coupons WHERE code = 'SAVE20'"
     ) as cursor:
         row = await cursor.fetchone()
-    assert tuple(row) == (10, 20.0, 7, "STANDARD")
+    assert tuple(row) == (10, 20.0, 3, "STANDARD")
 
 
 @pytest.mark.parametrize(
