@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from app import clock as clock_module
 from app import db, service
 from app.main import app
+from tests.instrumentation import InFlightRecorder
 
 #: Every test that needs a "now" hangs off this, so expiry maths in tests is
 #: explicit rather than relative to whenever the suite happens to run.
@@ -68,6 +69,34 @@ async def assert_invariants(connection) -> None:
             f"{code}: stored redeemed_count {counter} disagrees with "
             f"{active} active redemption rows"
         )
+
+
+def pytest_report_header(config):
+    """Environment banner, so a pasted result says what it ran against."""
+    return [
+        f"run at         {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        "storage        SQLite (file-backed, WAL)",
+        "topology       single process, single event loop",
+        "serialisation  module-level asyncio.Lock + conditional UPDATE",
+    ]
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    """Instrument the service entry points to record real concurrency.
+
+    Returns a factory; call it with a label and the expected call count before
+    firing a burst. Patching ``service.*`` reaches the routes too, since
+    ``app.main`` resolves these by attribute at call time.
+    """
+
+    def make(label: str, expected: int, every: int = 25) -> InFlightRecorder:
+        recorder = InFlightRecorder(label, expected, every)
+        for name in ("redeem", "cancel"):
+            monkeypatch.setattr(service, name, recorder.wrap(getattr(service, name)))
+        return recorder
+
+    return make
 
 
 @pytest.fixture(autouse=True)

@@ -34,9 +34,10 @@ def report(title: str, rows: list[tuple[str, object]]) -> None:
     print()
 
 
-async def test_scenario_1_burst_cannot_exceed_max_redemptions(client, conn):
+async def test_scenario_1_burst_cannot_exceed_max_redemptions(client, conn, probe):
     """200 simultaneous checkouts against 50 slots. The count must be exact."""
     await seed_coupon(client, max_redemptions=MAX_REDEMPTIONS)
+    recorder = probe("Oversubscription burst", BURST)
 
     responses = await asyncio.gather(
         *(
@@ -53,6 +54,7 @@ async def test_scenario_1_burst_cannot_exceed_max_redemptions(client, conn):
     report(
         "SCENARIO 1 — burst of simultaneous redemptions cannot oversell",
         [
+            *recorder.summary(),
             ("Coupon max_redemptions", MAX_REDEMPTIONS),
             ("Simultaneous POST /redeem", BURST),
             ("Succeeded", tally["success"]),
@@ -70,6 +72,8 @@ async def test_scenario_1_burst_cannot_exceed_max_redemptions(client, conn):
     assert set(tally) == {"success", "NO_REDEMPTIONS_LEFT"}
     assert final["redeemed_count"] == MAX_REDEMPTIONS
     assert final["remaining"] == 0
+    # If the calls never overlapped, the burst proved nothing about contention.
+    assert recorder.peak > 1, "requests did not actually run concurrently"
     # The stored counter and the actual rows must agree — a counter that is
     # right by luck while the ledger disagrees is still a bug.
     assert await stored_count(conn) == await active_count(conn) == MAX_REDEMPTIONS
@@ -118,9 +122,10 @@ async def test_scenario_2_retry_with_same_key_is_charged_once(client, conn):
     assert await active_count(conn) == 1
 
 
-async def test_scenario_2b_simultaneous_retries_are_charged_once(client, conn):
+async def test_scenario_2b_simultaneous_retries_are_charged_once(client, conn, probe):
     """The harder version: the retry arrives while the first is still in flight."""
     await seed_coupon(client, max_redemptions=MAX_REDEMPTIONS)
+    recorder = probe("Idempotent burst", 50, every=10)
 
     responses = await asyncio.gather(*(redeem(client, key="inflight-key") for _ in range(50)))
 
@@ -131,6 +136,7 @@ async def test_scenario_2b_simultaneous_retries_are_charged_once(client, conn):
     report(
         "SCENARIO 2b — 50 *simultaneous* retries of one key charge once",
         [
+            *recorder.summary(),
             ("Simultaneous POST /redeem", len(responses)),
             ("Shared Idempotency-Key", "inflight-key"),
             ("Real redemptions", len(fresh)),
@@ -188,10 +194,11 @@ async def test_scenario_3_double_cancel_returns_the_slot_once(client, conn):
     assert await stored_count(conn) == await active_count(conn) == 0
 
 
-async def test_scenario_3b_simultaneous_cancels_return_the_slot_once(client, conn):
+async def test_scenario_3b_simultaneous_cancels_return_the_slot_once(client, conn, probe):
     """40 concurrent cancels of one order still refund exactly one slot."""
     await seed_coupon(client, max_redemptions=MAX_REDEMPTIONS)
     await redeem(client, order_id="order-1")
+    recorder = probe("Double-cancel burst", 40, every=10)
 
     responses = await asyncio.gather(
         *(client.post("/orders/order-1/cancel") for _ in range(40))
@@ -203,6 +210,7 @@ async def test_scenario_3b_simultaneous_cancels_return_the_slot_once(client, con
     report(
         "SCENARIO 3b — 40 *simultaneous* cancels return the slot once",
         [
+            *recorder.summary(),
             ("Simultaneous cancels", len(responses)),
             ("All HTTP 200", all(r.status_code == 200 for r in responses)),
             ("cancelled: true", len(refunded)),
