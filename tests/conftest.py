@@ -6,6 +6,7 @@ same WAL-mode file backend the service actually runs on.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from app import clock as clock_module
-from app import db
+from app import db, service
 from app.main import app
 
 #: Every test that needs a "now" hangs off this, so expiry maths in tests is
@@ -70,16 +71,20 @@ async def assert_invariants(connection) -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_write_lock():
-    """Fail loudly if a test leaves the module-level lock held.
+def fresh_write_lock():
+    """Give each test its own lock, bound to that test's event loop.
 
-    The lock is module state shared across tests; a leaked hold would deadlock
-    whatever ran next, with a timeout as the only clue.
+    ``asyncio.Lock`` binds to the first loop that acquires it, and pytest-asyncio
+    runs every test on a new loop — so a module-level lock created at import
+    raises "bound to a different event loop" from the second test onward. It is
+    a test-harness problem only: the real process has one loop for its lifetime.
+
+    Rebinding here also stops a lock left held by a failing test from
+    deadlocking every test after it.
     """
+    service.write_lock = asyncio.Lock()
     yield
-    from app.service import write_lock
-
-    assert not write_lock.locked(), "test finished while still holding write_lock"
+    assert not service.write_lock.locked(), "test finished while still holding write_lock"
 
 
 @pytest_asyncio.fixture

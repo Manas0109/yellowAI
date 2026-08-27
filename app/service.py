@@ -5,10 +5,21 @@ no two write paths can interleave, and the redemption cap holds under a burst
 of simultaneous checkouts.
 
 That guarantee is only true **within one process**. See the README: a
-multi-worker deploy would give each worker its own lock and break it. The
-database-level defences below (``BEGIN IMMEDIATE``, the conditional ``UPDATE``,
-the UNIQUE constraints) are kept precisely so the invariant does not rest
-solely on deployment topology.
+multi-worker deploy would give each worker its own lock and break it.
+
+The lock is not merely an optimisation over the database-level defences. All
+requests share a single ``aiosqlite`` connection, and SQLite cannot nest
+transactions on one connection — so with the lock removed, overlapping redeems
+do not degrade into a race, they fail outright with "cannot start a transaction
+within a transaction". This is verified: sabotaging the lock makes
+``tests/test_concurrency.py`` fail with exactly that error.
+
+The database-level defences below (``BEGIN IMMEDIATE``, the conditional
+``UPDATE``, the UNIQUE constraints) are therefore a second line of defence
+against a *different* failure — a future refactor to a connection pool or
+multiple workers, where overlapping transactions become possible and a
+read-then-write would silently lose updates. They are not redundant, but they
+do not make the lock optional today.
 """
 
 from __future__ import annotations
@@ -76,8 +87,10 @@ async def redeem(request: RedeemRequest, idempotency_key: str) -> RedeemResponse
             if await _order_has_redemption(tx, request.order_id):
                 raise OrderAlreadyHasRedemption(request.order_id)
 
-            # The check and the increment are one statement, so no read-then-write
-            # window exists even if the lock above were removed.
+            # The check and the increment are one statement, so there is no
+            # read-then-write window to lose an update in. Redundant while the
+            # lock serialises writers, and the thing that would still hold the
+            # cap if this ever ran with a connection pool or several workers.
             cursor = await tx.execute(
                 "UPDATE coupons SET redeemed_count = redeemed_count + 1"
                 " WHERE code = ? AND redeemed_count < max_redemptions",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from tests.conftest import NOW, active_count, key_count, redeem, seed_coupon, stored_count
 
 
@@ -23,31 +25,30 @@ async def test_unknown_code(client):
     assert response.json()["error"] == "UNKNOWN_CODE"
 
 
-async def test_valid_strictly_before_expiry(client, frozen_clock):
+@pytest.mark.parametrize(
+    "offset,expected_status,expected_error",
+    [
+        (timedelta(microseconds=-1), 200, None),
+        (timedelta(0), 410, "COUPON_EXPIRED"),
+        (timedelta(microseconds=1), 410, "COUPON_EXPIRED"),
+    ],
+    ids=["one-microsecond-before", "exactly-at", "one-microsecond-after"],
+)
+async def test_expiry_boundary(client, frozen_clock, offset, expected_status, expected_error):
+    """`expires_at` is the first invalid instant, not the last valid one.
+
+    The boundary is pinned to the microsecond so this resolves the same way
+    every run — the point of the injectable clock.
+    """
     expires_at = NOW + timedelta(days=1)
     await seed_coupon(client, expires_at=expires_at)
 
-    frozen_clock.set(expires_at - timedelta(microseconds=1))
-    assert (await redeem(client)).status_code == 200
-
-
-async def test_expired_at_the_exact_instant(client, frozen_clock):
-    """`expires_at` is the first invalid instant, not the last valid one."""
-    expires_at = NOW + timedelta(days=1)
-    await seed_coupon(client, expires_at=expires_at)
-
-    frozen_clock.set(expires_at)
+    frozen_clock.set(expires_at + offset)
     response = await redeem(client)
-    assert response.status_code == 410
-    assert response.json()["error"] == "COUPON_EXPIRED"
 
-
-async def test_expired_after_the_instant(client, frozen_clock):
-    expires_at = NOW + timedelta(days=1)
-    await seed_coupon(client, expires_at=expires_at)
-
-    frozen_clock.set(expires_at + timedelta(microseconds=1))
-    assert (await redeem(client)).status_code == 410
+    assert response.status_code == expected_status
+    if expected_error:
+        assert response.json()["error"] == expected_error
 
 
 async def test_standard_is_once_per_customer(client):
@@ -121,6 +122,37 @@ async def test_precedence_reports_customer_over_capacity(client, conn):
 
     response = await redeem(client, order_id="order-2")
     assert response.json()["error"] == "CUSTOMER_ALREADY_REDEEMED"
+
+
+async def test_precedence_reports_unknown_code_over_everything(client, frozen_clock):
+    """An unknown code wins even when the request is otherwise doomed too."""
+    expires_at = NOW + timedelta(days=1)
+    await seed_coupon(client, max_redemptions=1, expires_at=expires_at)
+    await redeem(client, order_id="order-1")
+    frozen_clock.set(expires_at)
+
+    response = await redeem(client, code="NOPE", order_id="order-1")
+    assert response.status_code == 404
+    assert response.json()["error"] == "UNKNOWN_CODE"
+
+
+async def test_precedence_reports_order_conflict_over_capacity(client):
+    """Reused order_id beats a full coupon — the last link in the chain."""
+    await seed_coupon(client, code="REFER", max_redemptions=1, type="STACKABLE")
+    await redeem(client, code="REFER", order_id="order-1")
+
+    # The coupon is now full, and order-1 is taken. The order check runs first.
+    response = await redeem(client, code="REFER", customer_id="cust-9", order_id="order-1")
+    assert response.json()["error"] == "ORDER_ALREADY_HAS_REDEMPTION"
+
+
+async def test_happy_path_agrees_with_the_read_endpoint(client):
+    await seed_coupon(client, max_redemptions=10)
+    redeemed = await redeem(client)
+
+    read = await client.get("/coupons/SAVE20")
+    assert read.json()["remaining"] == redeemed.json()["remaining"] == 9
+    assert read.json()["redeemed_count"] == 1
 
 
 async def test_failures_leave_no_side_effect(client, conn):
