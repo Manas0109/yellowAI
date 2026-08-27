@@ -134,3 +134,58 @@ async def test_get_db_raises_before_lifespan_starts():
     await db.disconnect()
     with pytest.raises(RuntimeError):
         db.get_db()
+
+
+@pytest.mark.parametrize(
+    "pragma,expected",
+    [("foreign_keys", 1), ("synchronous", 1), ("busy_timeout", 5000)],
+)
+async def test_remaining_pragmas_are_applied(conn, pragma, expected):
+    """`synchronous` 1 is NORMAL — the durable-enough companion setting for WAL."""
+    async with conn.execute(f"PRAGMA {pragma};") as cursor:
+        assert (await cursor.fetchone())[0] == expected
+
+
+async def test_row_factory_gives_mapping_access(conn):
+    await seed_coupon(conn)
+    async with conn.execute("SELECT code, max_redemptions FROM coupons") as cursor:
+        row = await cursor.fetchone()
+    assert row["code"] == "SAVE20"
+    assert row["max_redemptions"] == COUPON[1]
+
+
+async def test_coupon_type_must_be_a_known_enum_value(conn):
+    with pytest.raises(sqlite3.IntegrityError):
+        await seed_coupon(conn, coupon_type="GIFT")
+
+
+async def test_coupon_boundary_values_are_accepted(conn):
+    """The CHECKs are `> 0` and `<= 100`, so 1 and 100.0 must both insert."""
+    await conn.execute(
+        "INSERT INTO coupons (code, max_redemptions, discount_percent, expires_at,"
+        " type, redeemed_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("EDGE", 1, 100.0, COUPON[3], "STACKABLE", 0, COUPON[6]),
+    )
+    await conn.commit()
+
+
+@pytest.mark.parametrize(
+    "coupon_type,status",
+    [("STANDARD", "REFUNDED"), ("GIFT", "ACTIVE")],
+)
+async def test_redemption_check_constraints_reject_bad_values(conn, coupon_type, status):
+    await seed_coupon(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        await insert_redemption(conn, "order-1", coupon_type=coupon_type, status=status)
+
+
+async def test_foreign_key_to_coupons_is_enforced(conn):
+    """Proves `PRAGMA foreign_keys=ON` took effect — SQLite ignores FKs without it."""
+    with pytest.raises(sqlite3.IntegrityError):
+        await insert_redemption(conn, "order-1", code="NO-SUCH-CODE")
+
+
+async def test_disconnect_closes_the_connection(conn):
+    await db.disconnect()
+    with pytest.raises(ValueError):  # aiosqlite: no active connection
+        await conn.execute("SELECT 1")
